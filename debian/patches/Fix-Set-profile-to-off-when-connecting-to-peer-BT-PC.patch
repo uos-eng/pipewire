@@ -1,0 +1,135 @@
+From a61497ddfe32a6f1967d3358eada04d870630b63 Mon Sep 17 00:00:00 2001
+From: Chengyi Zhao <zhaochengyi@uniontech.com>
+Date: Wed, 25 Mar 2026 14:57:27 +0800
+Subject: [PATCH] fix: Set profile to off when connecting to peer Bluetooth PC
+ device
+
+---
+ spa/plugins/bluez5/bluez5-device.c | 38 ++++++++++++++++++++++++++++++
+ spa/plugins/bluez5/defs.h          |  5 ++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/spa/plugins/bluez5/bluez5-device.c b/spa/plugins/bluez5/bluez5-device.c
+index fc659f6..53c698d 100644
+--- a/spa/plugins/bluez5/bluez5-device.c
++++ b/spa/plugins/bluez5/bluez5-device.c
+@@ -1430,6 +1430,13 @@ static bool validate_profile(struct impl *this, uint32_t profile,
+ 
+ static int set_profile(struct impl *this, uint32_t profile, enum spa_bluetooth_audio_codec codec, bool save)
+ {
++	enum spa_bt_form_factor ff;
++
++	ff = spa_bt_form_factor_from_class(this->bt_dev->bluetooth_class);
++
++	if (ff == SPA_BT_FORM_FACTOR_COMPUTER)
++		return 0;
++
+ 	if (!validate_profile(this, profile, codec)) {
+ 		spa_log_warn(this->log, "trying to set invalid profile %d, codec %d, %08x %08x",
+ 			    profile, codec,
+@@ -1617,6 +1624,12 @@ static void profiles_changed(void *userdata, uint32_t connected_change)
+ 	struct impl *this = userdata;
+ 	bool nodes_changed = false;
+ 
++	enum spa_bt_form_factor ff = spa_bt_form_factor_from_class(this->bt_dev->bluetooth_class);
++	if (ff == SPA_BT_FORM_FACTOR_COMPUTER) {
++		spa_bt_device_release_transports(this->bt_dev);
++		return;
++	}
++
+ 	/* Profiles changed. We have to re-emit device information. */
+ 	spa_log_info(this->log, "profiles changed to %08x %08x (change %08x) switching_codec:%d",
+ 			this->bt_dev->profiles, this->bt_dev->connected_profiles,
+@@ -1948,6 +1961,7 @@ static void set_initial_profile(struct impl *this)
+ {
+ 	struct spa_bt_transport *t;
+ 	int i;
++	enum spa_bt_form_factor ff;
+ 
+ 	this->switching_codec = false;
+ 
+@@ -1956,6 +1970,13 @@ static void set_initial_profile(struct impl *this)
+ 	this->supported_codecs = spa_bt_device_get_supported_media_codecs(
+ 		this->bt_dev, &this->supported_codec_count);
+ 
++	ff = spa_bt_form_factor_from_class(this->bt_dev->bluetooth_class);
++
++	if (ff == SPA_BT_FORM_FACTOR_COMPUTER) {
++		spa_bt_device_release_transports(this->bt_dev);
++		goto off;
++	}
++
+ 	/* Prefer BAP, then A2DP, then HFP, then null, but select AG if the device
+ 	   appears not to have BAP_SINK, A2DP_SINK or any HEAD_UNIT profile */
+ 
+@@ -2014,6 +2035,14 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
+ 	uint32_t n_source = 0, n_sink = 0;
+ 	uint32_t capture[1] = { DEVICE_ID_SOURCE }, playback[1] = { DEVICE_ID_SINK };
+ 	int priority;
++	enum spa_bt_form_factor ff;
++
++	ff = spa_bt_form_factor_from_class(this->bt_dev->bluetooth_class);
++	/* For Computer devices, only allow the off profile */
++	if (ff == SPA_BT_FORM_FACTOR_COMPUTER) {
++		if (profile_index != DEVICE_PROFILE_OFF)
++			return NULL;
++	}
+ 
+ 	switch (profile_index) {
+ 	case DEVICE_PROFILE_OFF:
+@@ -2459,6 +2488,12 @@ static struct spa_pod *build_route(struct impl *this, struct spa_pod_builder *b,
+ 		hfp_description = _("Handsfree");
+ 		port_type = "phone";
+ 		break;
++	case SPA_BT_FORM_FACTOR_COMPUTER:
++		name_prefix = "computer";
++		description = _("Computer");
++		hfp_description = _("Bluetooth (HFP)");
++		port_type = "computer";
++		break;
+ 	case SPA_BT_FORM_FACTOR_UNKNOWN:
+ 	default:
+ 		name_prefix = "bluetooth";
+@@ -2534,6 +2569,9 @@ static struct spa_pod *build_route(struct impl *this, struct spa_pod_builder *b,
+ 		return NULL;
+ 	}
+ 
++	if (!strcmp(port_type, "computer"))
++		available = SPA_PARAM_AVAILABILITY_no;
++
+ 	if (profile != SPA_ID_INVALID && !profile_has_route(profile, route))
+ 		return NULL;
+ 
+diff --git a/spa/plugins/bluez5/defs.h b/spa/plugins/bluez5/defs.h
+index 0fae18f..4ed5dd3 100644
+--- a/spa/plugins/bluez5/defs.h
++++ b/spa/plugins/bluez5/defs.h
+@@ -393,6 +393,7 @@ enum spa_bt_form_factor {
+ 	SPA_BT_FORM_FACTOR_CAR,
+ 	SPA_BT_FORM_FACTOR_HIFI,
+ 	SPA_BT_FORM_FACTOR_PHONE,
++	SPA_BT_FORM_FACTOR_COMPUTER,
+ };
+ 
+ static inline const char *spa_bt_form_factor_name(enum spa_bt_form_factor ff)
+@@ -416,6 +417,8 @@ static inline const char *spa_bt_form_factor_name(enum spa_bt_form_factor ff)
+ 		return "hifi";
+ 	case SPA_BT_FORM_FACTOR_PHONE:
+ 		return "phone";
++	case SPA_BT_FORM_FACTOR_COMPUTER:
++		return "computer";
+ 	case SPA_BT_FORM_FACTOR_UNKNOWN:
+ 	default:
+ 		return "unknown";
+@@ -456,6 +459,8 @@ static inline enum spa_bt_form_factor spa_bt_form_factor_from_class(uint32_t blu
+ 	minor = (bluetooth_class >> 2) & 0x3F;
+ 
+ 	switch (major) {
++	case 1:
++		return SPA_BT_FORM_FACTOR_COMPUTER;
+ 	case 2:
+ 		return SPA_BT_FORM_FACTOR_PHONE;
+ 	case 4:
+-- 
+2.20.1
+
